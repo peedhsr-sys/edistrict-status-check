@@ -23,7 +23,7 @@ def get_status(app_number, captcha_solution):
     try:
         # Step 1: GET request to fetch ViewState
         response = session.get(base_url, headers=headers)
-        soup = BeautifulSoup(response.text, 'lxml')
+        soup = BeautifulSoup(response.text, 'html.parser')
         
         # Extract hidden fields
         viewstate = soup.find('input', {'id': '__VIEWSTATE'})
@@ -45,8 +45,7 @@ def get_status(app_number, captcha_solution):
         
         # Step 3: POST request to check status
         post_response = session.post(base_url, data=post_data, headers=headers)
-        post_soup = BeautifulSoup(post_response.text, 'lxml')
-        
+        post_soup = BeautifulSoup(post_response.text, 'html.parser')
         # Step 4: Extract status from response
         # यह HTML structure पर निर्भर करता है - तुम्हें inspect करके सही selector ढूंढना होगा
         status_info = extract_status_info(post_soup)
