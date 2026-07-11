@@ -1,60 +1,29 @@
 from flask import Flask, request, render_template_string, jsonify, send_file
 import requests
 from bs4 import BeautifulSoup
-import re
-import os
+from PIL import Image
+import pytesseract
 from io import BytesIO
+import os
+import re
 
 app = Flask(__name__)
 
-# Global session to maintain cookies
-sessions = {}
-
-def get_session(session_id):
-    if session_id not in sessions:
-        sessions[session_id] = requests.Session()
-    return sessions[session_id]
-
-@app.route('/captcha-image')
-def get_captcha_image():
-    """Captcha image fetch करें और display करें"""
-    session_id = request.args.get('session', 'default')
-    session = get_session(session_id)
-    
-    base_url = "https://edistrict.up.gov.in/edistrict/showStatushome.aspx"
-    
+def solve_captcha(image_bytes):
+    """Captcha image ko text mein convert kare"""
     try:
-        # First visit to get captcha
-        response = session.get(base_url, timeout=30)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Find captcha image
-        captcha_img = soup.find('img', {'id': 'imgCaptcha'})
-        
-        if captcha_img and 'src' in captcha_img.attrs:
-            captcha_src = captcha_img['src']
-            
-            # If relative URL, make it absolute
-            if captcha_src.startswith('/'):
-                captcha_url = f"https://edistrict.up.gov.in{captcha_src}"
-            else:
-                captcha_url = captcha_src
-            
-            # Fetch captcha image
-            img_response = session.get(captcha_url, timeout=30)
-            
-            return send_file(
-                BytesIO(img_response.content),
-                mimetype='image/jpeg'
-            )
-        
-        return jsonify({'error': 'Captcha image not found'}), 404
-        
+        img = Image.open(BytesIO(image_bytes))
+        img = img.convert('L')  # Grayscale
+        text = pytesseract.image_to_string(img, config='--psm 7').strip()
+        text = ''.join(e for e in text if e.isalnum())
+        return text.upper()
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"OCR Error: {e}")
+        return None
 
-def get_status(app_number, captcha_solution, session_id='default'):
-    session = get_session(session_id)
+def check_status(app_number):
+    """eDistrict UP se status check kare"""
+    session = requests.Session()
     base_url = "https://edistrict.up.gov.in/edistrict/showStatushome.aspx"
     
     headers = {
@@ -62,247 +31,242 @@ def get_status(app_number, captcha_solution, session_id='default'):
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
         'Referer': 'https://edistrict.up.gov.in/edistrict/showStatushome.aspx',
-        'Content-Type': 'application/x-www-form-urlencoded',
     }
     
     try:
-        # GET request to fetch ViewState
+        # Step 1: Page load karo
         response = session.get(base_url, headers=headers, timeout=30)
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Extract hidden fields
+        # Hidden fields nikalo
         viewstate = soup.find('input', {'id': '__VIEWSTATE'})
-        viewstate_generator = soup.find('input', {'id': '__VIEWSTATEGENERATOR'})
-        event_validation = soup.find('input', {'id': '__EVENTVALIDATION'})
+        viewstate_gen = soup.find('input', {'id': '__VIEWSTATEGENERATOR'})
+        event_val = soup.find('input', {'id': '__EVENTVALIDATION'})
         
-        if not all([viewstate, viewstate_generator, event_validation]):
-            return {'error': 'Could not fetch required form fields'}
+        if not all([viewstate, viewstate_gen, event_val]):
+            return {'error': 'Form fields nahi mile'}
         
-        # Prepare POST data
+        # Captcha image dhundho
+        captcha_img = soup.find('img', {'id': 'imgCaptcha'})
+        if not captcha_img or 'src' not in captcha_img.attrs:
+            return {'error': 'Captcha image nahi mila'}
+        
+        # Captcha URL banayo
+        captcha_src = captcha_img['src']
+        if captcha_src.startswith('/'):
+            captcha_url = f"https://edistrict.up.gov.in{captcha_src}"
+        else:
+            captcha_url = captcha_src
+        
+        # Captcha image download karo
+        img_response = session.get(captcha_url, timeout=30)
+        
+        # Auto solve captcha
+        captcha_text = solve_captcha(img_response.content)
+        
+        if not captcha_text:
+            return {'error': 'Captcha solve nahi ho saka'}
+        
+        print(f"Solved Captcha: {captcha_text}")
+        
+        # POST data banayo
         post_data = {
             '__VIEWSTATE': viewstate.get('value', ''),
-            '__VIEWSTATEGENERATOR': viewstate_generator.get('value', ''),
-            '__EVENTVALIDATION': event_validation.get('value', ''),
+            '__VIEWSTATEGENERATOR': viewstate_gen.get('value', ''),
+            '__EVENTVALIDATION': event_val.get('value', ''),
             'txtApplicationNo': app_number,
-            'txtCaptcha': captcha_solution,
+            'txtCaptcha': captcha_text,
             'btnSubmit': 'Search'
         }
         
-        # POST request
+        # Status check karo
         post_response = session.post(base_url, data=post_data, headers=headers, timeout=30)
         post_soup = BeautifulSoup(post_response.text, 'html.parser')
         
-        # Extract status
-        status_info = extract_status_info(post_soup)
+        # Result extract karo
+        result = extract_result(post_soup)
         
         return {
             'success': True,
             'application_number': app_number,
-            'status': status_info
+            'captcha_used': captcha_text,
+            'result': result
         }
         
     except Exception as e:
         return {'error': str(e)}
 
-def extract_status_info(soup):
-    status_data = {}
-    try:
-        tables = soup.find_all('table')
-        for table in tables:
-            if 'status' in str(table).lower():
-                status_data['table_found'] = True
-                break
-        
-        status_divs = soup.find_all('div', class_=re.compile(r'status|result|info', re.I))
-        if status_divs:
-            status_data['divs_found'] = len(status_divs)
-            for i, div in enumerate(status_divs[:3]):
-                status_data[f'div_{i}'] = div.get_text(strip=True)[:200]
-                
-    except Exception as e:
-        status_data['error'] = str(e)
+def extract_result(soup):
+    """Response se result nikalo"""
+    result_data = {}
     
-    return status_data
+    # Tables check karo
+    tables = soup.find_all('table')
+    for table in tables:
+        rows = table.find_all('tr')
+        for row in rows:
+            cells = row.find_all(['td', 'th'])
+            if len(cells) >= 2:
+                key = cells[0].get_text(strip=True)
+                value = cells[1].get_text(strip=True)
+                if key and value:
+                    result_data[key] = value
+    
+    # Agar table mein nahi mila, to body text check karo
+    if not result_data:
+        body_text = soup.get_text()
+        if 'Invalid' in body_text or 'incorrect' in body_text.lower():
+            result_data['message'] = 'Invalid Captcha - Dobara try karein'
+        elif 'No record' in body_text:
+            result_data['message'] = 'Koi record nahi mila'
+        else:
+            result_data['message'] = 'Response mila, par format samajh nahi aaya'
+    
+    return result_data
 
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/check-status', methods=['POST'])
-def check_status_api():
+@app.route('/check', methods=['POST'])
+def check():
     data = request.get_json() or request.form
     app_number = data.get('application_number', '').strip()
-    captcha = data.get('captcha', '').strip()
-    session_id = data.get('session_id', 'default')
     
     if not app_number:
-        return jsonify({'error': 'Application number required'}), 400
-    if not captcha:
-        return jsonify({'error': 'Captcha required'}), 400
+        return jsonify({'error': 'Application number chahiye'}), 400
     
-    result = get_status(app_number, captcha, session_id)
+    result = check_status(app_number)
     return jsonify(result)
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'})
 
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="hi">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>eDistrict UP Status Checker</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: Arial, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 0;
             padding: 20px;
         }
         .container {
-            max-width: 600px;
-            margin: 0 auto;
             background: white;
-            padding: 30px;
-            border-radius: 10px;
+            padding: 40px;
+            border-radius: 15px;
             box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+            max-width: 500px;
+            width: 100%;
         }
-        h1 { text-align: center; color: #333; margin-bottom: 20px; }
-        .form-group { margin-bottom: 20px; }
-        label { display: block; margin-bottom: 8px; font-weight: bold; color: #555; }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
         input[type="text"] {
             width: 100%;
-            padding: 12px;
-            border: 2px solid #ddd;
-            border-radius: 5px;
-            font-size: 16px;
-        }
-        .captcha-box {
-            background: #f5f5f5;
             padding: 15px;
-            border-radius: 5px;
-            text-align: center;
             margin-bottom: 20px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            box-sizing: border-box;
         }
-        .captcha-box img {
-            border: 2px solid #333;
-            border-radius: 5px;
-            margin: 10px 0;
-            max-width: 100%;
-            background: white;
-        }
-        .refresh-captcha {
-            background: #667eea;
-            color: white;
-            border: none;
-            padding: 8px 15px;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 14px;
-        }
-        .refresh-captcha:hover { background: #5568d3; }
-        button[type="submit"] {
+        button {
             width: 100%;
             padding: 15px;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             border: none;
-            border-radius: 5px;
+            border-radius: 8px;
             font-size: 18px;
             font-weight: bold;
             cursor: pointer;
         }
-        button[type="submit"]:hover { transform: translateY(-2px); }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+        }
         #result {
             margin-top: 20px;
             padding: 20px;
-            border-radius: 5px;
+            border-radius: 8px;
             display: none;
         }
-        .success { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
-        .error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+        .success { background: #d4edda; border: 2px solid #28a745; color: #155724; }
+        .error { background: #f8d7da; border: 2px solid #dc3545; color: #721c24; }
         .loading { text-align: center; color: #667eea; font-weight: bold; }
+        pre {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            margin-top: 10px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🎯 eDistrict UP Status Checker</h1>
-        
-        <div class="form-group">
-            <label>Application Number:</label>
-            <input type="text" id="appNumber" placeholder="UP1234567890">
-        </div>
-        
-        <div class="captcha-box">
-            <label>Captcha:</label>
-            <img id="captchaImg" src="/captcha-image?session=default" alt="Captcha" style="display:none;">
-            <br>
-            <button type="button" class="refresh-captcha" onclick="refreshCaptcha()">🔄 Refresh Captcha</button>
-            <br><br>
-            <input type="text" id="captcha" placeholder="Captcha यहाँ टाइप करें" style="width:200px;">
-        </div>
-        
-        <button type="submit" onclick="checkStatus()">Check Status</button>
-        
+        <h1>🎯 eDistrict UP Status</h1>
+        <input type="text" id="appNumber" placeholder="Application Number (e.g., UP1234567890)">
+        <button onclick="checkStatus()">Auto Check Status</button>
         <div id="result"></div>
     </div>
 
     <script>
-        let sessionId = 'default_' + Date.now();
-        
-        // Show captcha image when it loads
-        document.getElementById('captchaImg').onload = function() {
-            this.style.display = 'inline-block';
-        };
-        
-        function refreshCaptcha() {
-            sessionId = 'session_' + Date.now();
-            document.getElementById('captchaImg').src = '/captcha-image?session=' + sessionId + '&t=' + Date.now();
-            document.getElementById('captcha').value = '';
-            document.getElementById('captcha').focus();
-        }
-        
         async function checkStatus() {
             const appNumber = document.getElementById('appNumber').value.trim();
-            const captcha = document.getElementById('captcha').value.trim();
             const resultDiv = document.getElementById('result');
             
-            if (!appNumber) { alert('Application Number डालें'); return; }
-            if (!captcha) { alert('Captcha डालें'); return; }
+            if (!appNumber) {
+                alert('Application number daalo!');
+                return;
+            }
             
             resultDiv.style.display = 'block';
             resultDiv.className = 'loading';
-            resultDiv.innerHTML = '⏳ Processing...';
+            resultDiv.innerHTML = '⏳ Captcha solve kar rahe hain... (10-20 sec)';
             
             try {
-                const response = await fetch('/check-status', {
+                const response = await fetch('/check', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        application_number: appNumber,
-                        captcha: captcha,
-                        session_id: sessionId
-                    })
+                    body: JSON.stringify({application_number: appNumber})
                 });
                 
                 const data = await response.json();
                 
                 if (data.error) {
                     resultDiv.className = 'error';
-                    resultDiv.innerHTML = `<strong>Error:</strong> ${data.error}`;
+                    resultDiv.innerHTML = `<strong>❌ Error:</strong> ${data.error}`;
                 } else {
                     resultDiv.className = 'success';
-                    resultDiv.innerHTML = `<h3>✅ Status Found!</h3><pre>${JSON.stringify(data, null, 2)}</pre>`;
+                    resultDiv.innerHTML = `
+                        <h3>✅ Status Found!</h3>
+                        <p><strong>Application:</strong> ${data.application_number}</p>
+                        <p><strong>Captcha Used:</strong> ${data.captcha_used}</p>
+                        <pre>${JSON.stringify(data.result, null, 2)}</pre>
+                    `;
                 }
             } catch (error) {
                 resultDiv.className = 'error';
-                resultDiv.innerHTML = `<strong>Error:</strong> ${error.message}`;
+                resultDiv.innerHTML = `<strong>❌ Error:</strong> ${error.message}`;
             }
         }
         
-        // Auto load captcha on page load
-        window.onload = function() {
-            refreshCaptcha();
-        };
+        document.getElementById('appNumber').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') checkStatus();
+        });
     </script>
 </body>
 </html>
